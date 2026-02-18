@@ -1,9 +1,11 @@
 """
 Scratch agent: explicit control loop from first principles.
 No agent framework. Loop: Reason -> Decide -> Act -> Observe -> Update -> Reflect.
+Sales-rep flow: company name, industry, profile -> value hypothesis, messaging angle, supporting evidence.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
@@ -154,15 +156,64 @@ def _reflect(context: str, observation: str, decision: Decision) -> Dict[str, An
         return {"confidence": decision.confidence, "should_revise": False, "critique": str(e)}
 
 
-def run_agent(task: str, max_steps: Optional[int] = None) -> str:
+def _parse_sales_rep_output(final_response: str) -> Dict[str, str]:
+    """
+    Parse final response into value_hypothesis, messaging_angle, supporting_evidence.
+    Prefer section headers (VALUE HYPOTHESIS:, etc.); fallback to LLM extraction.
+    """
+    out: Dict[str, str] = {
+        "value_hypothesis": "",
+        "messaging_angle": "",
+        "supporting_evidence": "",
+    }
+    text = (final_response or "").strip()
+    # Section headers (case-insensitive, allow variations)
+    patterns = [
+        (r"VALUE\s*HYPOTHESIS\s*[:\-]\s*(.+?)(?=MESSAGING|SUPPORTING|$)", "value_hypothesis"),
+        (r"MESSAGING\s*(?:ANGLE)?\s*[:\-]\s*(.+?)(?=VALUE|SUPPORTING|$)", "messaging_angle"),
+        (r"SUPPORTING\s*EVIDENCE(?:\s*OR\s*ASSUMPTIONS)?\s*[:\-]\s*(.+?)(?=VALUE|MESSAGING|$)", "supporting_evidence"),
+    ]
+    for pattern, key in patterns:
+        m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+        if m:
+            out[key] = m.group(1).strip()
+    if any(out.values()):
+        return out
+    # Fallback: one LLM call to structure the response, then parse once
+    try:
+        prompt = (
+            f"Convert this sales-rep response into exactly three short sections. "
+            f"Output only the following format, nothing else:\n"
+            f"VALUE HYPOTHESIS: <one or two sentences>\n"
+            f"MESSAGING ANGLE: <one or two sentences>\n"
+            f"SUPPORTING EVIDENCE: <bullets or short paragraph>\n\n"
+            f"Response to convert:\n{text[:4000]}"
+        )
+        structured = _call_model(prompt, "parse_output")
+        for pattern, key in patterns:
+            m = re.search(pattern, (structured or "").strip(), re.DOTALL | re.IGNORECASE)
+            if m:
+                out[key] = m.group(1).strip()
+        if any(out.values()):
+            return out
+    except Exception:
+        pass
+    out["value_hypothesis"] = text[:1500] or "(No value hypothesis extracted)"
+    out["messaging_angle"] = "(No messaging angle extracted)" if not out["messaging_angle"] else out["messaging_angle"]
+    out["supporting_evidence"] = "(No supporting evidence extracted)" if not out["supporting_evidence"] else out["supporting_evidence"]
+    return out
+
+
+def run_agent(task: str, max_steps: Optional[int] = None, tool_registry: Optional[Dict[str, Any]] = None) -> str:
     """
     Run the scratch agent loop until done or max_steps.
     Returns the final response to the user.
+    If tool_registry is provided, use it; otherwise use get_tool_registry().
     """
     max_steps = max_steps or MAX_STEPS
     memory = AgentMemory()
     turn_history: List[Dict[str, Any]] = []
-    registry = get_tool_registry()
+    registry = tool_registry if tool_registry is not None else get_tool_registry()
     tool_descriptions = "\n".join(
         f"- {tid}: {spec.get('description', '')} (params: {spec.get('parameters', {})})"
         for tid, spec in registry.items()
@@ -215,7 +266,47 @@ def run_agent(task: str, max_steps: Optional[int] = None) -> str:
     return final_response
 
 
+SALES_REP_TASK_TEMPLATE = """Company: {company_name}
+Industry: {industry}
+
+Public website or profile text:
+{profile_text}
+
+Your goal: Propose (1) a value hypothesis, (2) a suggested messaging angle, (3) supporting evidence or assumptions. You may use the extract_insights tool on the profile to get structured insights first, then synthesize your answer.
+
+When you stop and respond, format your final answer with these exact section headers so it can be parsed:
+VALUE HYPOTHESIS: <your value hypothesis>
+MESSAGING ANGLE: <your suggested messaging angle>
+SUPPORTING EVIDENCE: <supporting evidence or assumptions>"""
+
+
+def run_sales_rep_flow(
+    company_name: str,
+    industry: str,
+    profile_text: str,
+    max_steps: Optional[int] = None,
+) -> Dict[str, str]:
+    """
+    Sales-rep flow: given company name, industry, and profile/website text,
+    run the agent loop and return structured value_hypothesis, messaging_angle, supporting_evidence.
+    """
+    task = SALES_REP_TASK_TEMPLATE.format(
+        company_name=company_name,
+        industry=industry,
+        profile_text=(profile_text or "").strip(),
+    )
+    registry = get_tool_registry(profile_text=(profile_text or "").strip())
+    final_response = run_agent(task, max_steps=max_steps, tool_registry=registry)
+    parsed = _parse_sales_rep_output(final_response)
+    return parsed
+
+
 if __name__ == "__main__":
-    # Example: run with a task so the loop, tool path, memory, and reflection are visible
-    result = run_agent("Find contact info for Acme Corp.")
-    print("Final response:", result)
+    # Demo sales-rep flow: company, industry, profile -> value hypothesis, messaging angle, supporting evidence
+    sample_profile = (
+        "K2X Technologies is a software solutions company that provides a cloud-based platform for industrial IoT and predictive maintenance."
+    )
+    result = run_sales_rep_flow("K2X Technologies", "Software Solutions", sample_profile)
+    print("Value hypothesis:", result["value_hypothesis"])
+    print("Messaging angle:", result["messaging_angle"])
+    print("Supporting evidence:", result["supporting_evidence"])

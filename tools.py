@@ -1,47 +1,42 @@
 """
 Tool registry and implementations for the scratch agent.
 Tools are chosen by the model in the Decide step; the loop runs registry[tool_id].fn(**tool_input).
+No mock data: extract_insights uses the LLM over the provided profile text.
 """
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 # Tool shape: id, description, parameters (schema), fn
 ToolSpec = Dict[str, Any]
 
-# Mock data for demo; model-driven tool use does not depend on this content
-MOCK_SEARCH_RESULTS: Dict[str, List[Dict[str, Any]]] = {
-    "acme": [
-        {"company": "Acme Corp", "industry": "Manufacturing", "revenue": "10M"},
-        {"company": "Acme Labs", "industry": "Tech", "revenue": "2M"},
-    ],
-    "tech": [
-        {"company": "TechStart Inc", "industry": "SaaS", "revenue": "5M"},
-    ],
-}
-
-MOCK_CONTACTS: Dict[str, Dict[str, Any]] = {
-    "acme": {"name": "Jane Doe", "role": "VP Sales", "email": "jane@acme.com"},
-    "techstart": {"name": "John Smith", "role": "CEO", "email": "john@techstart.com"},
-}
+EXTRACT_INSIGHTS_PROMPT = (
+    "From this company profile, extract key facts, pain points, opportunities, and differentiators. "
+    "Return a concise bullet list. Do not invent information; only summarize what is in the profile.\n\n"
+    "Profile:\n{profile_text}"
+)
 
 
-def _search(query: str) -> str:
-    """Search for companies by keyword. Returns mock results."""
-    key = query.lower().strip() if query else ""
-    results = MOCK_SEARCH_RESULTS.get(key, MOCK_SEARCH_RESULTS.get("acme", []))
-    if not results:
-        return "No results found."
-    lines = [f"- {r.get('company', '?')} ({r.get('industry', '?')}, {r.get('revenue', '?')})" for r in results]
-    return "\n".join(lines)
+def _make_extract_insights_fn(profile_text_in_scope: str) -> Callable[..., str]:
+    """Build extract_insights that closes over profile_text (used when profile is in scope for this run)."""
+
+    def _extract_insights(profile_text: Optional[str] = None) -> str:
+        from local_llm import complete
+        text = (profile_text or "").strip() or profile_text_in_scope
+        if not text:
+            return "No profile text provided to extract insights from."
+        prompt = EXTRACT_INSIGHTS_PROMPT.format(profile_text=text[:8000])
+        return complete(prompt)
+
+    return _extract_insights
 
 
-def _get_contact(company_key: str) -> str:
-    """Get contact info for a company by key (e.g. acme, techstart)."""
-    key = (company_key or "").lower().strip()
-    contact = MOCK_CONTACTS.get(key)
-    if not contact:
-        return f"No contact found for '{company_key}'. Known keys: {list(MOCK_CONTACTS.keys())}"
-    return f"Name: {contact['name']}, Role: {contact['role']}, Email: {contact['email']}"
+def _extract_insights_no_profile(profile_text: Optional[str] = None) -> str:
+    """Fallback when no profile in scope; profile should be in task context. Model can pass a snippet via tool_input."""
+    from local_llm import complete
+    if not profile_text or not str(profile_text).strip():
+        return "No profile text in this call. The company profile is in the task context above; use it to reason and then stop with your answer."
+    prompt = EXTRACT_INSIGHTS_PROMPT.format(profile_text=str(profile_text)[:8000])
+    return complete(prompt)
 
 
 def _safe_call(fn: Callable[..., Any], **kwargs: Any) -> Any:
@@ -49,23 +44,25 @@ def _safe_call(fn: Callable[..., Any], **kwargs: Any) -> Any:
     return fn(**kwargs)
 
 
-def get_tool_registry() -> Dict[str, ToolSpec]:
+def get_tool_registry(profile_text: Optional[str] = None) -> Dict[str, ToolSpec]:
     """
     Registry of tools the model can choose from.
-    Each tool has id, description, parameters, and fn. No fixed order of execution.
+    When profile_text is provided (sales-rep flow), extract_insights uses it. Otherwise the tool
+    expects profile to be in the task context or passed via tool_input.
     """
+    if profile_text is not None:
+        fn = _make_extract_insights_fn(profile_text)
+        # Model can call with empty args; we use closed-over profile
+        params = "optional profile_text; the profile is already in scope for this run"
+    else:
+        fn = _extract_insights_no_profile
+        params = "optional profile_text; if not provided, profile is in the task context"
     return {
-        "search": {
-            "id": "search",
-            "description": "Search for companies by keyword (e.g. acme, tech). Returns company name, industry, revenue.",
-            "parameters": {"query": "string search term"},
-            "fn": _search,
-        },
-        "get_contact": {
-            "id": "get_contact",
-            "description": "Get contact details for a company by key (e.g. acme, techstart).",
-            "parameters": {"company_key": "string company identifier"},
-            "fn": _get_contact,
+        "extract_insights": {
+            "id": "extract_insights",
+            "description": "Extract key facts, pain points, and opportunities from the company profile text. Use this to structure the profile before proposing value hypothesis and messaging.",
+            "parameters": {"profile_text": params},
+            "fn": fn,
         },
     }
 
@@ -79,4 +76,5 @@ def run_tool(registry: Dict[str, ToolSpec], tool_id: str, tool_input: Dict[str, 
         raise ValueError(f"Unknown tool: {tool_id}. Available: {list(registry.keys())}")
     spec = registry[tool_id]
     fn = spec["fn"]
+    # Pass through tool_input; extract_insights may have profile_text or empty dict
     return _safe_call(fn, **tool_input)
