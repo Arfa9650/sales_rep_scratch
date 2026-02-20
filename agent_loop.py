@@ -1,17 +1,20 @@
 """
 Scratch agent: explicit control loop from first principles.
 No agent framework. Loop: Reason -> Decide -> Act -> Observe -> Update -> Reflect.
-Sales-rep flow: company name, industry, profile -> value hypothesis, messaging angle, supporting evidence.
+Sales-rep assistant: you represent a company (who you're selling for); prospect is the company you're exploring/contacting.
 """
 
 import logging
+import os
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import (
     DECIDE_PARSE_RETRIES,
     MAX_STEPS,
     MEMORY_RECENT_K,
+    MIN_CONFIDENCE_TO_STOP,
     MODEL_ERROR_RETRIES,
 )
 from decisions import Decision, parse_decision, parse_reflection
@@ -73,11 +76,15 @@ def _decide(context: str, reason_text: str, tool_descriptions: str) -> Decision:
     """
     prompt = (
         f"{context}\n\n"
-        f"Your reasoning so far: {reason_text[:300]}\n\n"
+        f"Your reasoning so far: {reason_text[:500]}\n\n"
         f"Available tools:\n{tool_descriptions}\n\n"
-        "Decide: What should I do next? Do I need a tool (if so, which id and what arguments)? "
-        "Is my information sufficient? How confident am I (0-1)? Should I revise my approach? Should I stop and respond to the user? "
-        "Respond with a short reasoning and, if possible, a JSON object with: next_action, tool_id, tool_input (dict), confidence, should_stop, should_revise, reasoning."
+        "Decide: What should I do next? "
+        "If you lack company/industry details or the profile is thin: set should_stop to false and use a tool. "
+        "Use search_web with a concrete query (e.g. company name, industry trends) or extract_insights on the profile. "
+        "Only set should_stop to true when you have enough to write concrete VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE. "
+        "Do not stop with 'insufficient information'—use search_web first to gather more, then stop only when confident. "
+        "After search_web or extract_insights, use save_note to store key facts (content: string) so they appear in the next step and you avoid hallucination. "
+        "Respond with reasoning and a JSON object: next_action, tool_id (e.g. 'search_web', 'extract_insights', or 'save_note'), tool_input (e.g. {\"query\": \"...\"} or {\"content\": \"...\"}), confidence (0-1), should_stop, should_revise, reasoning."
     )
     last_error: Optional[Exception] = None
     for attempt in range(DECIDE_PARSE_RETRIES + 1):
@@ -143,8 +150,8 @@ def _reflect(context: str, observation: str, decision: Decision) -> Dict[str, An
     prompt = (
         f"{context}\n\n"
         f"Last observation: {observation}\n\n"
-        "Evaluate: What assumptions are you making? Is your information sufficient? "
-        "How confident are you (0-1)? Should you revise your approach or stop and answer the user?"
+        "Evaluate: What assumptions are you making? Is your information sufficient to write VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE? "
+        "How confident are you (0-1)? If information is still insufficient, recommend continuing and using a tool (e.g. search_web) next step. Should you revise or stop and answer?"
     )
     try:
         raw = _call_model(prompt, "reflect")
@@ -204,16 +211,25 @@ def _parse_sales_rep_output(final_response: str) -> Dict[str, str]:
     return out
 
 
-def run_agent(task: str, max_steps: Optional[int] = None, tool_registry: Optional[Dict[str, Any]] = None) -> str:
+def run_agent(
+    task: str,
+    max_steps: Optional[int] = None,
+    tool_registry: Optional[Dict[str, Any]] = None,
+    profile_text: Optional[str] = None,
+) -> str:
     """
     Run the scratch agent loop until done or max_steps.
     Returns the final response to the user.
-    If tool_registry is provided, use it; otherwise use get_tool_registry().
+    If tool_registry is provided, use it. Otherwise use get_tool_registry(profile_text=..., memory=memory)
+    so that save_note is available (memory is created here).
     """
     max_steps = max_steps or MAX_STEPS
     memory = AgentMemory()
     turn_history: List[Dict[str, Any]] = []
-    registry = tool_registry if tool_registry is not None else get_tool_registry()
+    if tool_registry is not None:
+        registry = tool_registry
+    else:
+        registry = get_tool_registry(profile_text=profile_text, memory=memory)
     tool_descriptions = "\n".join(
         f"- {tid}: {spec.get('description', '')} (params: {spec.get('parameters', {})})"
         for tid, spec in registry.items()
@@ -253,6 +269,23 @@ def run_agent(task: str, max_steps: Optional[int] = None, tool_registry: Optiona
         if should_revise:
             logger.info("Revising: looping again without advancing to final answer.")
             continue
+        # Only accept stop if confidence is high enough (so model iterates with tools until satisfied)
+        confidence_ok = decision.confidence >= MIN_CONFIDENCE_TO_STOP
+        # Reject stop when model said "insufficient" / "need more" but didn't use a tool this step
+        insufficient_but_no_tool = (
+            decision.should_stop
+            and not decision.tool_id
+            and any(
+                phrase in (decision.reasoning or "").lower()
+                for phrase in ("insufficient", "need more", "need additional", "lack ", "not enough")
+            )
+        )
+        if decision.should_stop and (insufficient_but_no_tool or not confidence_ok):
+            if insufficient_but_no_tool:
+                logger.info("Rejecting stop: model said information insufficient but did not use a tool; continuing.")
+            else:
+                logger.info("Rejecting stop: confidence %.2f < %.2f; continuing.", decision.confidence, MIN_CONFIDENCE_TO_STOP)
+            continue
         if decision.should_stop:
             done = True
             final_response = decision.reasoning or observation or "Task completed."
@@ -266,13 +299,19 @@ def run_agent(task: str, max_steps: Optional[int] = None, tool_registry: Optiona
     return final_response
 
 
-SALES_REP_TASK_TEMPLATE = """Company: {company_name}
-Industry: {industry}
+SALES_REP_TASK_TEMPLATE = """You are a sales rep assistant.
 
+Who you represent (your company / who you are selling for):
+{my_company_description}
+
+Prospect (the company you are exploring or contacting):
+Company: {company_name}
+Industry: {industry}
 Public website or profile text:
 {profile_text}
 
-Your goal: Propose (1) a value hypothesis, (2) a suggested messaging angle, (3) supporting evidence or assumptions. You may use the extract_insights tool on the profile to get structured insights first, then synthesize your answer.
+Your goal: Propose (1) a value hypothesis, (2) a suggested messaging angle, (3) supporting evidence or assumptions.
+You must use tools when information is thin: use search_web to look up the company and industry, and extract_insights on the profile. After getting results, use save_note to store key facts so they are available in the next step (reduces hallucination). Do not stop with "insufficient information"—iterate: search, save key findings, then synthesize. Only stop when you have enough to write concrete VALUE HYPOTHESIS, MESSAGING ANGLE, and SUPPORTING EVIDENCE.
 
 When you stop and respond, format your final answer with these exact section headers so it can be parsed:
 VALUE HYPOTHESIS: <your value hypothesis>
@@ -281,32 +320,49 @@ SUPPORTING EVIDENCE: <supporting evidence or assumptions>"""
 
 
 def run_sales_rep_flow(
-    company_name: str,
-    industry: str,
-    profile_text: str,
+    my_company_description: str,
+    prospect_company_name: str,
+    prospect_industry: str,
+    prospect_profile_text: str,
     max_steps: Optional[int] = None,
 ) -> Dict[str, str]:
     """
-    Sales-rep flow: given company name, industry, and profile/website text,
-    run the agent loop and return structured value_hypothesis, messaging_angle, supporting_evidence.
+    Sales-rep flow: you represent my_company_description; the prospect is the company you're contacting.
+    Returns structured value_hypothesis, messaging_angle, supporting_evidence.
+    Logs are written to the logs/ directory at the end of the run.
     """
-    task = SALES_REP_TASK_TEMPLATE.format(
-        company_name=company_name,
-        industry=industry,
-        profile_text=(profile_text or "").strip(),
-    )
-    registry = get_tool_registry(profile_text=(profile_text or "").strip())
-    final_response = run_agent(task, max_steps=max_steps, tool_registry=registry)
-    parsed = _parse_sales_rep_output(final_response)
-    return parsed
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    logger.addHandler(file_handler)
+    try:
+        task = SALES_REP_TASK_TEMPLATE.format(
+            my_company_description=(my_company_description or "").strip(),
+            company_name=prospect_company_name,
+            industry=prospect_industry,
+            profile_text=(prospect_profile_text or "").strip(),
+        )
+        final_response = run_agent(
+            task, max_steps=max_steps, profile_text=(prospect_profile_text or "").strip()
+        )
+        parsed = _parse_sales_rep_output(final_response)
+        return parsed
+    finally:
+        logger.removeHandler(file_handler)
+        file_handler.close()
 
 
 if __name__ == "__main__":
-    # Demo sales-rep flow: company, industry, profile -> value hypothesis, messaging angle, supporting evidence
-    sample_profile = (
-        "K2X Technologies is a software solutions company that provides a cloud-based platform for industrial IoT and predictive maintenance."
-    )
-    result = run_sales_rep_flow("K2X Technologies", "Software Solutions", sample_profile)
+    # Who you represent (your company)
+    my_company = "K2X Technologies: We provide AI-driven software solutions for industrial companies to improve operational efficiency and reduce downtime."
+    # Prospect you are exploring/contacting
+    prospect_name = "Antonx"
+    prospect_industry = "Software Solutions"
+    prospect_profile = "antonx.com"
+
+    result = run_sales_rep_flow(my_company, prospect_name, prospect_industry, prospect_profile)
     print("Value hypothesis:", result["value_hypothesis"])
     print("Messaging angle:", result["messaging_angle"])
     print("Supporting evidence:", result["supporting_evidence"])
